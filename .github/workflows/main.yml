@@ -19,25 +19,64 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        cache: 'yarn'
 
-    - name: Install dependencies
+    - name: Enable Corepack
       run: |
-        yarn install --frozen-lockfile
+        corepack enable
+        corepack prepare yarn@stable --activate
+
+    - name: Check package.json packageManager field
+      run: |
+        echo "Package manager configurado:"
+        cat package.json | grep packageManager || echo "Sem campo packageManager"
+        
+    - name: Fix packageManager if needed
+      run: |
+        # Remove o campo packageManager problemático
+        cd ${{ github.workspace }}
+        node -e "
+        const fs = require('fs');
+        const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+        delete pkg.packageManager;
+        fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+        "
+        # Também verifica na pasta example
+        if [ -f example/package.json ]; then
+          cd example
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          delete pkg.packageManager;
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+        fi
+
+    - name: Install dependencies (root)
+      run: |
+        yarn install --frozen-lockfile || yarn install
+
+    - name: Install dependencies (example)
+      run: |
         cd example
-        yarn install --frozen-lockfile
+        yarn install --frozen-lockfile || yarn install
 
     - name: Setup Ruby
       uses: ruby/setup-ruby@v1
       with:
         ruby-version: '3.2'
         bundler-cache: true
+        working-directory: example/ios
 
     - name: Install CocoaPods
       run: |
         cd example/ios
+        # Verifica se já tem Gemfile
+        if [ ! -f Gemfile ]; then
+          bundle init
+          bundle add cocoapods
+        fi
         bundle install
-        bundle exec pod install
+        bundle exec pod install || pod install
 
     - name: Setup Xcode
       uses: maxim-lobanov/setup-xcode@v1
@@ -63,18 +102,45 @@ jobs:
         </plist>
         EOF
 
+    - name: Find correct workspace and scheme
+      run: |
+        cd example/ios
+        echo "Workspaces disponíveis:"
+        find . -name "*.xcworkspace" -maxdepth 1
+        echo "Projects disponíveis:"
+        find . -name "*.xcodeproj" -maxdepth 1
+        
+        # Extrai nomes para usar nos próximos passos
+        WORKSPACE=$(find . -name "*.xcworkspace" -maxdepth 1 | head -1 | sed 's/\.\///')
+        echo "WORKSPACE_NAME=$WORKSPACE" >> $GITHUB_ENV
+        
+        # Tenta encontrar o scheme
+        if [ -n "$WORKSPACE" ]; then
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list | grep -A 10 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+          echo "SCHEME_NAME=$SCHEME" >> $GITHUB_ENV
+        fi
+
     - name: Build Archive
       run: |
         cd example/ios
         xcodebuild archive \
-          -workspace example.xcworkspace \
-          -scheme example \
+          -workspace "$WORKSPACE_NAME" \
+          -scheme "$SCHEME_NAME" \
           -archivePath ${{ github.workspace }}/build/example.xcarchive \
           -configuration Debug \
           -sdk iphoneos \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
+        || xcodebuild archive \
+          -project *.xcodeproj \
+          -scheme "$SCHEME_NAME" \
+          -archivePath ${{ github.workspace }}/build/example.xcarchive \
+          -configuration Debug \
+          -sdk iphoneos \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY=""
 
     - name: Export IPA
       run: |
@@ -88,7 +154,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: example-app.ipa
-        path: ${{ github.workspace }}/build/example.ipa
+        path: ${{ github.workspace }}/build/*.ipa
         retention-days: 7
 
     - name: Upload Archive
