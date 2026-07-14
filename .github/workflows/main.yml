@@ -22,43 +22,103 @@ jobs:
 
     - name: Install Yarn Classic
       run: |
-        # Desativa corepack para evitar interferência
         corepack disable
         npm install -g yarn@1.22.22
         yarn --version
 
-    - name: Fix package.json files
+    - name: Debug repository structure
       run: |
-        # Remove packageManager field e ajusta para Yarn 1
+        echo "=== Estrutura do projeto ==="
+        ls -la
+        echo ""
+        echo "=== package.json raiz ==="
+        cat package.json | grep -A 20 "workspaces" || echo "Sem workspaces definidos"
+        echo ""
+        echo "=== Diretórios de pacotes ==="
+        find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" | sort
+        echo ""
+        echo "=== Conteúdo dos workspaces ==="
+        for dir in */; do
+          if [ -f "$dir/package.json" ]; then
+            echo "--- $dir ---"
+            cat "$dir/package.json" | grep '"name"'
+          fi
+        done
+
+    - name: Check and fix workspaces
+      run: |
+        # Verifica se @react-native-video/drm existe localmente
+        if [ -d "drm" ] && [ -f "drm/package.json" ]; then
+          echo "✅ Pasta drm encontrada"
+          cat drm/package.json | grep '"name"'
+        else
+          echo "❌ Pasta drm NÃO encontrada"
+        fi
+        
+        # Lista todos os pacotes locais
+        echo ""
+        echo "Pacotes locais disponíveis:"
+        find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" -not -path "*/example/*" -not -path "*/docs/*" -exec grep '"name"' {} +
+
+    - name: Fix package.json for local dependencies
+      run: |
+        # Atualiza o package.json raiz para garantir que os workspaces estão corretos
         node -e "
         const fs = require('fs');
-        ['package.json', 'example/package.json'].forEach(file => {
-          if (fs.existsSync(file)) {
-            const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
-            delete pkg.packageManager;
-            fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
-            console.log(file + ' atualizado');
+        const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+        delete pkg.packageManager;
+        
+        // Garante que workspaces está definido
+        if (!pkg.workspaces) {
+          // Procura por pacotes locais
+          const packages = [];
+          const dirs = fs.readdirSync('.', { withFileTypes: true });
+          for (const dir of dirs) {
+            if (dir.isDirectory() && !dir.name.startsWith('.') && !['example', 'docs', 'node_modules'].includes(dir.name)) {
+              if (fs.existsSync(dir.name + '/package.json')) {
+                packages.push(dir.name);
+              }
+            }
           }
-        });
+          
+          if (packages.length > 0) {
+            pkg.workspaces = packages.map(p => p + '/*');
+            // Ou simplesmente:
+            // pkg.workspaces = ['*'];
+            console.log('Workspaces adicionados:', pkg.workspaces);
+          }
+        }
+        
+        fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+        console.log('package.json atualizado com workspaces');
         "
 
-    - name: Install dependencies (root)
+    - name: Install dependencies with nohoist for React Native
       run: |
-        # Se existe yarn.lock, usa --frozen-lockfile, senão gera um novo
-        if [ -f yarn.lock ]; then
-          yarn install --frozen-lockfile
-        else
-          yarn install
+        # Cria .yarnrc se não existir
+        if [ ! -f .yarnrc ]; then
+          cat > .yarnrc << EOF
+        nmHoistingLimits "workspaces"
+        EOF
         fi
+        
+        # Tenta instalar com yarn
+        yarn install --no-lockfile 2>&1 || yarn install --no-lockfile --network-timeout 100000
 
     - name: Install dependencies (example)
       working-directory: example
       run: |
-        if [ -f yarn.lock ]; then
-          yarn install --frozen-lockfile
-        else
-          yarn install
-        fi
+        # Remove packageManager se existir
+        node -e "
+        const fs = require('fs');
+        if (fs.existsSync('package.json')) {
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          delete pkg.packageManager;
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+        }
+        "
+        
+        yarn install --no-lockfile
 
     - name: Setup Ruby
       uses: ruby/setup-ruby@v1
@@ -90,7 +150,7 @@ jobs:
           <key>method</key>
           <string>development</string>
           <key>teamID</key>
-          <string>pmamama</string>
+          <string>YOUR_TEAM_ID</string>
           <key>compileBitcode</key>
           <false/>
           <key>uploadSymbols</key>
@@ -99,37 +159,39 @@ jobs:
         </plist>
         EOF
 
-    - name: Find correct workspace and scheme
+    - name: Find workspace and scheme
       working-directory: example/ios
       run: |
-        echo "Procurando workspace e scheme..."
+        echo "Procurando workspace..."
+        find . -name "*.xcworkspace" -maxdepth 1 -not -name "Pods.xcworkspace"
         
-        # Lista workspaces disponíveis
-        WORKSPACES=$(find . -name "*.xcworkspace" -maxdepth 1 -not -name "Pods.xcworkspace")
-        echo "Workspaces: $WORKSPACES"
-        
-        # Pega o primeiro workspace que não seja Pods
-        WORKSPACE=$(echo "$WORKSPACES" | head -1 | xargs basename)
-        echo "Usando workspace: $WORKSPACE"
+        WORKSPACE=$(find . -name "*.xcworkspace" -maxdepth 1 -not -name "Pods.xcworkspace" | head -1 | xargs basename)
+        echo "WORKSPACE=$WORKSPACE"
         echo "WORKSPACE_NAME=$WORKSPACE" >> $GITHUB_ENV
         
-        # Lista schemes disponíveis
-        if [ -n "$WORKSPACE" ]; then
-          SCHEMES=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -A 100 "Schemes:" | grep -v "Schemes:" | grep -v "^$" | head -5)
-          echo "Schemes disponíveis:"
-          echo "$SCHEMES"
-          SCHEME=$(echo "$SCHEMES" | head -1 | xargs)
-          echo "Usando scheme: $SCHEME"
-          echo "SCHEME_NAME=$SCHEME" >> $GITHUB_ENV
-        fi
+        echo "Schemes disponíveis:"
+        xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -A 10 "Schemes:" || echo "Erro ao listar schemes"
+        
+        SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -A 10 "Schemes:" | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
+        echo "SCHEME=$SCHEME"
+        echo "SCHEME_NAME=$SCHEME" >> $GITHUB_ENV
 
     - name: Build Archive
       working-directory: example/ios
       run: |
-        echo "Construindo com workspace: $WORKSPACE_NAME"
-        echo "Construindo com scheme: $SCHEME_NAME"
+        echo "Construindo $WORKSPACE_NAME / $SCHEME_NAME"
         
         xcodebuild archive \
+          -workspace "$WORKSPACE_NAME" \
+          -scheme "$SCHEME_NAME" \
+          -archivePath ${{ github.workspace }}/build/App.xcarchive \
+          -configuration Debug \
+          -sdk iphoneos \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          ONLY_ACTIVE_ARCH=NO \
+          | xcpretty || xcodebuild archive \
           -workspace "$WORKSPACE_NAME" \
           -scheme "$SCHEME_NAME" \
           -archivePath ${{ github.workspace }}/build/App.xcarchive \
@@ -154,11 +216,3 @@ jobs:
         name: app.ipa
         path: ${{ github.workspace }}/build/*.ipa
         retention-days: 7
-
-    - name: Upload Archive
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: xcode-archive
-        path: ${{ github.workspace }}/build/*.xcarchive
-        retention-days: 3
