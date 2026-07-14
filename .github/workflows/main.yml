@@ -24,100 +24,38 @@ jobs:
       run: |
         corepack disable
         npm install -g yarn@1.22.22
-        yarn --version
 
-    - name: Debug repository structure
+    - name: Setup React Native environment
       run: |
-        echo "=== Estrutura do projeto ==="
-        ls -la
-        echo ""
-        echo "=== package.json raiz ==="
-        cat package.json | grep -A 20 "workspaces" || echo "Sem workspaces definidos"
-        echo ""
-        echo "=== Diretórios de pacotes ==="
-        find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" | sort
-        echo ""
-        echo "=== Conteúdo dos workspaces ==="
-        for dir in */; do
-          if [ -f "$dir/package.json" ]; then
-            echo "--- $dir ---"
-            cat "$dir/package.json" | grep '"name"'
-          fi
-        done
+        # Instala React Native CLI globalmente
+        npm install -g react-native-cli || true
+        npm install -g @react-native-community/cli || true
 
-    - name: Check and fix workspaces
-      run: |
-        # Verifica se @react-native-video/drm existe localmente
-        if [ -d "drm" ] && [ -f "drm/package.json" ]; then
-          echo "✅ Pasta drm encontrada"
-          cat drm/package.json | grep '"name"'
-        else
-          echo "❌ Pasta drm NÃO encontrada"
-        fi
-        
-        # Lista todos os pacotes locais
-        echo ""
-        echo "Pacotes locais disponíveis:"
-        find . -maxdepth 2 -name "package.json" -not -path "*/node_modules/*" -not -path "*/example/*" -not -path "*/docs/*" -exec grep '"name"' {} +
-
-    - name: Fix package.json for local dependencies
-      run: |
-        # Atualiza o package.json raiz para garantir que os workspaces estão corretos
-        node -e "
-        const fs = require('fs');
-        const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-        delete pkg.packageManager;
-        
-        // Garante que workspaces está definido
-        if (!pkg.workspaces) {
-          // Procura por pacotes locais
-          const packages = [];
-          const dirs = fs.readdirSync('.', { withFileTypes: true });
-          for (const dir of dirs) {
-            if (dir.isDirectory() && !dir.name.startsWith('.') && !['example', 'docs', 'node_modules'].includes(dir.name)) {
-              if (fs.existsSync(dir.name + '/package.json')) {
-                packages.push(dir.name);
-              }
-            }
-          }
-          
-          if (packages.length > 0) {
-            pkg.workspaces = packages.map(p => p + '/*');
-            // Ou simplesmente:
-            // pkg.workspaces = ['*'];
-            console.log('Workspaces adicionados:', pkg.workspaces);
-          }
-        }
-        
-        fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-        console.log('package.json atualizado com workspaces');
-        "
-
-    - name: Install dependencies with nohoist for React Native
-      run: |
-        # Cria .yarnrc se não existir
-        if [ ! -f .yarnrc ]; then
-          cat > .yarnrc << EOF
-        nmHoistingLimits "workspaces"
-        EOF
-        fi
-        
-        # Tenta instalar com yarn
-        yarn install --no-lockfile 2>&1 || yarn install --no-lockfile --network-timeout 100000
-
-    - name: Install dependencies (example)
+    - name: Install example dependencies directly
       working-directory: example
       run: |
-        # Remove packageManager se existir
+        # Remove packageManager problemático
         node -e "
         const fs = require('fs');
         if (fs.existsSync('package.json')) {
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           delete pkg.packageManager;
+          
+          // Substitui dependências locais por versões do npm
+          if (pkg.dependencies) {
+            Object.keys(pkg.dependencies).forEach(key => {
+              if (key.startsWith('@react-native-video/')) {
+                console.log('Substituindo', key, 'por versão npm');
+                pkg.dependencies[key] = 'latest';
+              }
+            });
+          }
+          
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
         }
         "
         
+        # Instala dependências
         yarn install --no-lockfile
 
     - name: Setup Ruby
@@ -159,41 +97,17 @@ jobs:
         </plist>
         EOF
 
-    - name: Find workspace and scheme
+    - name: Build and Export IPA
       working-directory: example/ios
       run: |
-        echo "Procurando workspace..."
-        find . -name "*.xcworkspace" -maxdepth 1 -not -name "Pods.xcworkspace"
-        
         WORKSPACE=$(find . -name "*.xcworkspace" -maxdepth 1 -not -name "Pods.xcworkspace" | head -1 | xargs basename)
-        echo "WORKSPACE=$WORKSPACE"
-        echo "WORKSPACE_NAME=$WORKSPACE" >> $GITHUB_ENV
-        
-        echo "Schemes disponíveis:"
-        xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -A 10 "Schemes:" || echo "Erro ao listar schemes"
-        
         SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | grep -A 10 "Schemes:" | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
-        echo "SCHEME=$SCHEME"
-        echo "SCHEME_NAME=$SCHEME" >> $GITHUB_ENV
-
-    - name: Build Archive
-      working-directory: example/ios
-      run: |
-        echo "Construindo $WORKSPACE_NAME / $SCHEME_NAME"
+        
+        echo "Workspace: $WORKSPACE | Scheme: $SCHEME"
         
         xcodebuild archive \
-          -workspace "$WORKSPACE_NAME" \
-          -scheme "$SCHEME_NAME" \
-          -archivePath ${{ github.workspace }}/build/App.xcarchive \
-          -configuration Debug \
-          -sdk iphoneos \
-          CODE_SIGNING_ALLOWED=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGN_IDENTITY="" \
-          ONLY_ACTIVE_ARCH=NO \
-          | xcpretty || xcodebuild archive \
-          -workspace "$WORKSPACE_NAME" \
-          -scheme "$SCHEME_NAME" \
+          -workspace "$WORKSPACE" \
+          -scheme "$SCHEME" \
           -archivePath ${{ github.workspace }}/build/App.xcarchive \
           -configuration Debug \
           -sdk iphoneos \
@@ -202,12 +116,10 @@ jobs:
           CODE_SIGN_IDENTITY="" \
           ONLY_ACTIVE_ARCH=NO
 
-    - name: Export IPA
-      run: |
         xcodebuild -exportArchive \
           -archivePath ${{ github.workspace }}/build/App.xcarchive \
           -exportPath ${{ github.workspace }}/build \
-          -exportOptionsPlist exportOptions.plist \
+          -exportOptionsPlist ${{ github.workspace }}/exportOptions.plist \
           CODE_SIGNING_ALLOWED=NO
 
     - name: Upload IPA
